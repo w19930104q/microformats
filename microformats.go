@@ -99,13 +99,20 @@ type RelURL struct {
 // parser parses a single HTML page for microformats.  parser is not thread
 // safe, and should only be used to parse a single document.
 type parser struct {
-	curData   *Data
-	curItem   *Microformat
-	base      *url.URL
+	curData *Data
+	curItem *Microformat
+	base    *url.URL
+	// baseFound tracks whether a <base> element has been encountered.
 	baseFound bool
 
-	// root node of the parsed document
-	root *html.Node
+	// ids maps id attribute values to the first node in document order with
+	// that id.  Duplicate ids resolve to the original document's first node.
+	ids map[string]*html.Node
+
+	// path holds the nodes currently being visited along a single include
+	// reference chain.  It is used to break reference cycles by ignoring back
+	// edges without suppressing extraction of any other property.
+	path map[*html.Node]bool
 }
 
 // Parse the microformats found in the HTML document read from r.  baseURL is
@@ -136,8 +143,9 @@ func ParseNode(doc *html.Node, baseURL *url.URL) *Data {
 		p.base = &url.URL{}
 	}
 	p.baseFound = false
-	p.root = doc
-	p.walk(doc)
+	p.ids = indexIDs(doc)
+	p.path = make(map[*html.Node]bool)
+	p.walk(doc, p.path)
 	return p.curData
 }
 
@@ -194,10 +202,13 @@ func expandURL(r string, base *url.URL) string {
 	return r
 }
 
-// walk the DOM rooted at node, storing parsed microformats in p.
+// walk the DOM rooted at node, storing parsed microformats in p.  path holds
+// the include reference chain currently being traversed, so that back edges
+// in a cyclic reference graph are skipped while every other field is still
+// extracted.
 //
 //nolint:gocyclo,funlen // maybe we'll refactor it one day
-func (p *parser) walk(node *html.Node) {
+func (p *parser) walk(node *html.Node, path map[*html.Node]bool) {
 	if isAtom(node, atom.Template) {
 		return
 	}
@@ -240,12 +251,22 @@ func (p *parser) walk(node *html.Node) {
 		p.curItem = curItem
 	}
 
-	// handle backcompat include pattern
+	// handle backcompat include pattern.  Referenced nodes are traversed in
+	// the order their references are declared and the source DOM is never
+	// modified: include references only steer the walk, they do not splice
+	// nodes into the tree.
+	var includeRefs []string
+	var includeReplace bool
 	if p.curItem != nil && p.curItem.backcompat {
-		refs, replace := p.backcompatIncludeRefs(node)
-		if len(refs) != 0 {
-			node = p.backcompatIncludeNode(node, refs, replace)
+		includeRefs, includeReplace = p.backcompatIncludeRefs(node)
+	}
+	if includeReplace {
+		// A replacing include stands in for the referencing node itself:
+		// walk its target (in declaration order) and nothing else.
+		if target := p.includeTarget(includeRefs, node, path); target != nil {
+			p.enter(target, path)
 		}
+		return
 	}
 
 	if !p.baseFound && isAtom(node, atom.Base) {
@@ -292,7 +313,20 @@ func (p *parser) walk(node *html.Node) {
 	}
 
 	for c := node.FirstChild; c != nil; c = c.NextSibling {
-		p.walk(c)
+		p.walk(c, path)
+	}
+
+	// non-replacing include references (itemref and td headers) are expanded
+	// after the node's own children, in declaration order.  Walking the real
+	// subtree first keeps property order identical to the original clone
+	// semantics, while references are still resolved before this node's own
+	// properties are finalized below.  Each reference gets a fresh view of
+	// the path so two references to the same node both resolve, while a back
+	// edge in a single chain only suppresses that edge.
+	if len(includeRefs) > 0 {
+		for _, target := range p.includeTargets(includeRefs, node, path) {
+			p.enter(target, path)
+		}
 	}
 
 	if curItem != nil {
@@ -376,7 +410,10 @@ func (p *parser) walk(node *html.Node) {
 				}
 				if value == nil {
 					value = new(string)
-					*value = strings.TrimSpace(getTextContent(node, p.imageAltSrcValue))
+					// include the text of non-replacing include references so
+					// the value matches the text of the node with its
+					// referenced children, without mutating the source DOM.
+					*value = strings.TrimSpace(p.includeTextContent(node, includeRefs, path, p.imageAltSrcValue))
 				}
 				if curItem != nil && p.curItem != nil {
 					embedValue = getFirstPropValue(curItem, "name")
@@ -418,16 +455,17 @@ func (p *parser) walk(node *html.Node) {
 					value = new(string)
 					*value = strings.TrimSpace(getTextContent(node, nil))
 				}
-				if value != nil {
-					*value = strings.TrimSpace(expandURL(*value, p.base))
-				}
-				if curItem != nil && p.curItem != nil {
-					embedValue = getFirstPropValue(curItem, "url")
-				}
+				// expand a copy of the value; the source attribute must never
+				// be modified so repeated parses remain independent.
+				expanded := strings.TrimSpace(expandURL(*value, p.base))
 
 				// for category URLs in backcompat mode, strip to the last path segment
 				if p.curItem != nil && p.curItem.backcompat && name == "category" {
-					*value = backcompatURLCategory(*value)
+					expanded = backcompatURLCategory(expanded)
+				}
+				value = &expanded
+				if curItem != nil && p.curItem != nil {
+					embedValue = getFirstPropValue(curItem, "url")
 				}
 			case "e":
 				if p.curItem != nil {
@@ -438,11 +476,15 @@ func (p *parser) walk(node *html.Node) {
 				var buf bytes.Buffer
 
 				for c := node.FirstChild; c != nil; c = c.NextSibling {
-					p.expandAttrURLs(c) // microformats/microformats2-parsing#38
+					// render a detached clone so expanding URLs for the HTML
+					// output (microformats/microformats2-parsing#38) never
+					// mutates the parsed document.
+					clone := cloneSubtree(c)
+					p.expandAttrURLs(clone)
 
 					// ignore errors from html.Render which nearly always result from being unable
 					// to write to the underlying io.Writer, which never happens with bytes.Buffer.
-					_ = html.Render(&buf, c)
+					_ = html.Render(&buf, clone)
 				}
 				htmlbody := strings.TrimSpace(buf.String())
 

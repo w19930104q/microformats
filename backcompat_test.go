@@ -4,6 +4,7 @@
 package microformats
 
 import (
+	"net/url"
 	"sort"
 	"testing"
 
@@ -136,24 +137,81 @@ func Test_BackcompatIncludeRefs(t *testing.T) {
 	}
 }
 
-func Test_BackcompatIncludeNode(t *testing.T) {
-	n, _ := parseNode("<p></p>")
-
+func Test_IndexIDs(t *testing.T) {
 	tests := []struct {
-		node    *html.Node
-		refs    []string
-		replace bool
-		want    *html.Node
+		name string
+		html string
+		want map[string]string // id -> rendered node, first match in document order
 	}{
-		{n, []string{}, false, n},
+		{"empty", "", map[string]string{}},
+		{
+			"single",
+			`<p id="a">one</p>`,
+			map[string]string{"a": `<p id="a">one</p>`},
+		},
+		{
+			"duplicate ids keep first",
+			`<p id="a">first</p><p id="a">second</p>`,
+			map[string]string{"a": `<p id="a">first</p>`},
+		},
+		{
+			"multiple",
+			`<div id="a"><span id="b"></span></div>`,
+			map[string]string{
+				"a": `<div id="a"><span id="b"></span></div>`,
+				"b": `<span id="b"></span>`,
+			},
+		},
 	}
 
 	for _, tt := range tests {
-		p := &parser{}
-		got := p.backcompatIncludeNode(tt.node, tt.refs, tt.replace)
-		if want := tt.want; !cmp.Equal(got, want) {
-			t.Errorf("backcompatIncludeNode(%v, %v, %v) returned %v, want %v", tt.node, tt.refs, tt.replace, got, want)
-		}
+		t.Run(tt.name, func(t *testing.T) {
+			n, err := parseNode(tt.html)
+			if err != nil {
+				t.Fatalf("Error parsing HTML: %v", err)
+			}
+			ids := indexIDs(n)
+			if got, want := len(ids), len(tt.want); got != want {
+				t.Fatalf("indexIDs(%q) returned %d ids, want %d", tt.html, got, want)
+			}
+			for id, wantRender := range tt.want {
+				got, ok := ids[id]
+				if !ok {
+					t.Errorf("indexIDs(%q) missing id %q", tt.html, id)
+					continue
+				}
+				if renderNode(got) != wantRender {
+					t.Errorf("indexIDs(%q) id %q = %q, want %q", tt.html, id, renderNode(got), wantRender)
+				}
+			}
+		})
+	}
+}
+
+func Test_CloneSubtree(t *testing.T) {
+	n, err := parseNode(`<div class="x" id="d"><a href="rel">link</a>text</div>`)
+	if err != nil {
+		t.Fatalf("Error parsing HTML: %v", err)
+	}
+	before := renderNode(n)
+
+	clone := cloneSubtree(n)
+	if clone == n || clone.Parent != nil || clone.PrevSibling != nil || clone.NextSibling != nil {
+		t.Errorf("cloneSubtree did not return a detached node: %#v", clone)
+	}
+
+	// mutate the clone, including its attribute slice and descendants
+	base, _ := url.Parse("http://example.com/")
+	(&parser{base: base}).expandAttrURLs(clone)
+	if got := clone.FirstChild; got == nil || getAttr(got, "href") != "http://example.com/rel" {
+		t.Errorf("expected expanded href on clone, got %v", got)
+	}
+
+	if got := renderNode(n); got != before {
+		t.Errorf("mutating clone altered source node:\n got  %q\n want %q", got, before)
+	}
+	if getAttr(n.FirstChild, "href") != "rel" {
+		t.Errorf("source attribute was mutated: %q", getAttr(n.FirstChild, "href"))
 	}
 }
 

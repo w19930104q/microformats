@@ -310,41 +310,86 @@ func (p *parser) backcompatIncludeRefs(node *html.Node) (refs []string, replace 
 	return refs, false
 }
 
-// backcompatIncludeNode includes referenced notes following the include
-// pattern.
-//
-// see backcompatIncludeRefs for information on refs and replace parameters.
-func (p *parser) backcompatIncludeNode(node *html.Node, refs []string, replace bool) *html.Node {
-	if len(refs) == 0 {
-		return node
+// indexIDs returns a map of every id attribute value in the tree rooted at
+// node to the first node carrying that id, in document order.  Nodes with no
+// id are omitted.  Duplicate ids therefore resolve to the original
+// document's first matching node, and references to an id that does not
+// exist simply find nothing.
+func indexIDs(node *html.Node) map[string]*html.Node {
+	ids := make(map[string]*html.Node)
+	if node == nil {
+		return ids
 	}
-
-	for _, ref := range refs {
-		if n := findNodeByID(p.root, ref); n != nil {
-			if node != n && !isAncestorNode(node, n) {
-				if replace {
-					return n
-				}
-				node.AppendChild(cloneNode(n))
+	var collect func(*html.Node)
+	collect = func(n *html.Node) {
+		if id := getAttr(n, "id"); id != "" {
+			if _, ok := ids[id]; !ok {
+				ids[id] = n
 			}
 		}
-	}
-
-	return node
-}
-
-// findNodeByID searches node and its children, returning the node with the
-// specified id value.
-func findNodeByID(node *html.Node, id string) *html.Node {
-	if getAttr(node, "id") == id {
-		return node
-	}
-	for c := node.FirstChild; c != nil; c = c.NextSibling {
-		if n := findNodeByID(c, id); n != nil {
-			return n
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			collect(c)
 		}
 	}
+	collect(node)
+	return ids
+}
+
+// includeTarget resolves a replacing include reference (class="include").
+// The references are declared in order; the first resolvable target that is
+// neither the referencing node itself nor one of its ancestors is returned,
+// matching the single-node replacement semantics of the include pattern.
+// A target already present on the current reference path is a back edge and
+// ignored.  Missing ids yield nil.
+func (p *parser) includeTarget(refs []string, node *html.Node, path map[*html.Node]bool) *html.Node {
+	for _, target := range p.includeTargets(refs, node, path) {
+		return target
+	}
 	return nil
+}
+
+// includeTargets resolves non-replacing include references (itemref and td
+// headers), returning the referenced nodes in declaration order.  Missing
+// ids are ignored, as are references to the node itself, its ancestors, or a
+// node already present on the current reference chain (a cyclic back edge).
+// Two independent references to the same node both resolve.
+func (p *parser) includeTargets(refs []string, node *html.Node, path map[*html.Node]bool) []*html.Node {
+	var targets []*html.Node
+	for _, ref := range refs {
+		target := p.ids[ref]
+		if target == nil || target == node || isAncestorNode(node, target) || path[target] {
+			continue
+		}
+		targets = append(targets, target)
+	}
+	return targets
+}
+
+// includeTextContent returns the concatenated text content of node and every
+// node referenced by its non-replacing include references, in the order those
+// references are declared.  This reproduces, without mutating the DOM, the
+// text the original parser observed after appending referenced clones as
+// children, which is used as the fallback value of a backcompat p-* property.
+// Cyclic references only skip the back edge itself; all other content is
+// still included.
+func (p *parser) includeTextContent(node *html.Node, refs []string, path map[*html.Node]bool, imgFn func(*html.Node) string) string {
+	var b strings.Builder
+	b.WriteString(getTextContent(node, imgFn))
+	for _, target := range p.includeTargets(refs, node, path) {
+		b.WriteString(getTextContent(target, imgFn))
+	}
+	return b.String()
+}
+
+// enter walks target while tracking it on the current include reference
+// path.  Pushing target before the walk makes any reference that leads back
+// to a node already on the chain a back edge, which the include resolution
+// skips; popping it afterwards keeps independent chains (including two
+// references to the same node) fully resolvable.
+func (p *parser) enter(target *html.Node, path map[*html.Node]bool) {
+	path[target] = true
+	p.walk(target, path)
+	delete(path, target)
 }
 
 // isAncestorNode returns true if parent is an ancestor node of child.
@@ -357,11 +402,37 @@ func isAncestorNode(child, parent *html.Node) bool {
 	return false
 }
 
-// cloneNode makes a copy of node, detaching any parent or sibling nodes.
-func cloneNode(node *html.Node) *html.Node {
+// cloneSubtree returns a deep copy of node and all of its descendants,
+// detached from any parent or sibling nodes.  Attribute slices are copied as
+// well, so expanding URLs on the clone can never alter the source node.
+func cloneSubtree(node *html.Node) *html.Node {
+	if node == nil {
+		return nil
+	}
 	clone := *node
 	clone.Parent = nil
 	clone.PrevSibling = nil
 	clone.NextSibling = nil
+	if len(node.Attr) > 0 {
+		clone.Attr = append([]html.Attribute(nil), node.Attr...)
+	}
+	var children []*html.Node
+	for c := node.FirstChild; c != nil; c = c.NextSibling {
+		child := cloneSubtree(c)
+		child.Parent = &clone
+		children = append(children, child)
+	}
+	for i, child := range children {
+		if i > 0 {
+			child.PrevSibling = children[i-1]
+		}
+		if i < len(children)-1 {
+			child.NextSibling = children[i+1]
+		}
+	}
+	if len(children) > 0 {
+		clone.FirstChild = children[0]
+		clone.LastChild = children[len(children)-1]
+	}
 	return &clone
 }
